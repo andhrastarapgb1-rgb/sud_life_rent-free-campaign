@@ -222,6 +222,9 @@ td.rank{ font-family:var(--font-display); font-weight:800; color:var(--primary);
 }
 .ach-edit:focus{ outline:none; border-color:var(--primary); background:#fff; box-shadow:0 0 0 3px var(--primary-light); }
 .save-flash{ animation:flash 1s ease; }
+.sync-status{ font-size:12px; margin-right:4px; }
+.sync-status.ok{ color:#1a7f3c; }
+.sync-status.bad{ color:#b45309; }
 @keyframes flash{ 0%{ background:var(--accent-light);} 100%{ background:transparent; } }
 
 /* ===== Controls row ===== */
@@ -514,6 +517,8 @@ td.rank{ font-family:var(--font-display); font-weight:800; color:var(--primary);
       </select>
       <button class="btn ghost small" id="regClear">Clear filters</button>
       <span style="flex:1"></span>
+      <span id="syncStatus" class="sync-status"></span>
+      <button class="btn ghost small" id="regSync">🔄 Sync now</button>
       <button class="btn small" id="regExport">Export CSV</button>
     </div>
 
@@ -573,68 +578,122 @@ const MONTHS = RAW_DATA.months; // ['AUG',...,'MAR']
 const MONTH_FULL = {AUG:'August',SEP:'September',OCT:'October',NOV:'November',DEC:'December',JAN:'January',FEB:'February',MAR:'March'};
 let branches = RAW_DATA.branches.map(b => ({...b, ach: b.ach.slice()}));
 
-const STORAGE_KEY = 'sud_rentfree_overrides_v1';
-const LOG_KEY = 'sud_rentfree_update_log_v1';
 const APP_PASSWORD = "Sudliferentfree2026";
 let updateLog = []; // {ts, sol, name, region, month, mode, amount, newTotal}
 let unlocked = false;
 
-/* ---------------- storage (persist edits) ---------------- */
+/* ---------------- shared backend config ----------------
+   Paste the Google Apps Script "Web app" URL here after deploying Code.gs
+   (see the setup notes at the top of that file). Everyone who opens this
+   HTML file will read and write edits through this same URL, so changes
+   are shared across all users instead of being stuck in one browser. */
+const API_URL = "https://script.google.com/macros/s/AKfycbxWlJOWBTYdFC_boEewXaCtrty-2LahG98pVDETnqDuXu_J5dKY5xCZiY2qpv7KpwmeLw/exec";
+
+const backendReady = API_URL && API_URL.indexOf('PASTE_') !== 0;
+let lastSyncOk = null; // null=not tried, true/false=last attempt result
+
+async function apiGet(action){
+  const res = await fetch(`${API_URL}?action=${action}`);
+  const json = await res.json();
+  if(json.error) throw new Error(json.error);
+  return json;
+}
+async function apiCall(params){
+  // Writes go through GET (query string) rather than POST. Apps Script Web
+  // Apps serve responses via an internal redirect, and browsers convert a
+  // POST into a GET when following a redirect — which silently drops the
+  // request body. Query-string params survive the redirect intact.
+  const qs = new URLSearchParams(params).toString();
+  const res = await fetch(`${API_URL}?${qs}`);
+  const json = await res.json();
+  if(json.error) throw new Error(json.error);
+  return json;
+}
+
+function setSyncStatus(ok, msg){
+  lastSyncOk = ok;
+  const el = document.getElementById('syncStatus');
+  if(!el) return;
+  el.textContent = msg;
+  el.className = 'sync-status ' + (ok ? 'ok' : 'bad');
+}
+
+/* ---------------- overrides (shared via Google Sheet) ---------------- */
 async function loadOverrides(){
+  if(!backendReady){
+    setSyncStatus(false, '⚠️ Backend not configured — edits will not be shared. See API_URL in the code.');
+    return;
+  }
   try{
-    if(!window.storage) return;
-    const res = await window.storage.get(STORAGE_KEY, false);
-    if(res && res.value){
-      const overrides = JSON.parse(res.value); // { sol: [ach0..ach7] }
-      branches.forEach(b=>{
-        if(overrides[b.sol]){
-          overrides[b.sol].forEach((v,i)=>{ if(v!==null && v!==undefined) b.ach[i]=v; });
-        }
-      });
-    }
-  }catch(e){ /* no saved overrides yet */ }
+    const overrides = await apiGet('overrides'); // { sol: [ach0..ach7] }
+    branches.forEach(b=>{
+      if(overrides[b.sol]){
+        overrides[b.sol].forEach((v,i)=>{ if(v!==null && v!==undefined) b.ach[i]=v; });
+      }
+    });
+    setSyncStatus(true, '✅ Synced with shared sheet — ' + new Date().toLocaleTimeString('en-IN'));
+  }catch(e){
+    console.warn('loadOverrides failed', e);
+    setSyncStatus(false, '⚠️ Could not reach shared sheet — showing last-known data.');
+  }
 }
 async function saveOverride(sol, achArray){
+  if(!backendReady) return;
   try{
-    if(!window.storage) return;
-    let overrides = {};
-    try{
-      const res = await window.storage.get(STORAGE_KEY, false);
-      if(res && res.value) overrides = JSON.parse(res.value);
-    }catch(e){ overrides = {}; }
-    overrides[sol] = achArray;
-    await window.storage.set(STORAGE_KEY, JSON.stringify(overrides), false);
-  }catch(e){ console.warn('storage save failed', e); }
+    await apiCall({ action:'saveOverride', sol, ach: JSON.stringify(achArray) });
+    setSyncStatus(true, '✅ Synced with shared sheet — ' + new Date().toLocaleTimeString('en-IN'));
+  }catch(e){
+    console.warn('saveOverride failed', e);
+    setSyncStatus(false, '⚠️ Save failed to reach the shared sheet — try again.');
+    toast('Could not save to the shared sheet — check your connection and try again.');
+  }
 }
 async function clearOverrides(){
-  try{
-    if(window.storage) await window.storage.delete(STORAGE_KEY, false);
-  }catch(e){}
+  if(backendReady){
+    try{ await apiCall({ action:'clearOverrides' }); }catch(e){ console.warn(e); }
+  }
   branches = RAW_DATA.branches.map(b => ({...b, ach: b.ach.slice()}));
   renderAll();
-  toast('Local edits cleared — showing original file data.');
+  toast('Shared edits cleared — showing original file data.');
 }
 
 async function loadLog(){
+  if(!backendReady) return;
   try{
-    if(!window.storage) return;
-    const res = await window.storage.get(LOG_KEY, false);
-    if(res && res.value){
-      updateLog = JSON.parse(res.value);
-    }
-  }catch(e){ /* no log yet */ }
+    updateLog = await apiGet('log');
+  }catch(e){ console.warn('loadLog failed', e); }
 }
 async function pushLogEntry(entry){
+  if(!backendReady) return;
   updateLog.unshift(entry);
   if(updateLog.length > 500) updateLog = updateLog.slice(0, 500);
   try{
-    if(window.storage) await window.storage.set(LOG_KEY, JSON.stringify(updateLog), false);
-  }catch(e){ console.warn('log save failed', e); }
+    await apiCall({ action:'pushLog', entry: JSON.stringify(entry) });
+  }catch(e){ console.warn('pushLog failed', e); }
 }
 async function clearLog(){
   updateLog = [];
-  try{ if(window.storage) await window.storage.delete(LOG_KEY, false); }catch(e){}
+  if(backendReady){
+    try{ await apiCall({ action:'clearLog' }); }catch(e){ console.warn(e); }
+  }
 }
+
+/* ---------------- manual + periodic re-sync ---------------- */
+async function syncNow(){
+  if(!backendReady){ toast('Backend not configured yet.'); return; }
+  await loadOverrides();
+  await loadLog();
+  renderAll(true);
+  toast('Refreshed from the shared sheet.');
+}
+function isEditingNow(){
+  const el = document.activeElement;
+  return !!(el && (el.tagName==='INPUT' || el.tagName==='SELECT') && el.closest('#panel-register, #updatePanel'));
+}
+setInterval(()=>{
+  if(!backendReady || isEditingNow()) return;
+  loadOverrides().then(()=>{ loadLog(); renderAll(true); });
+}, 45000);
 
 /* ---------------- helpers ---------------- */
 const fmtINR = n => {
@@ -1098,6 +1157,7 @@ document.getElementById('regClear').addEventListener('click', ()=>{
   document.getElementById('regStatus').value='';
   state.registerPage=0; renderRegister();
 });
+document.getElementById('regSync').addEventListener('click', ()=>{ syncNow(); });
 document.getElementById('pagePrev').addEventListener('click', ()=>{ state.registerPage--; renderRegister(); });
 document.getElementById('pageNext').addEventListener('click', ()=>{ state.registerPage++; renderRegister(); });
 
